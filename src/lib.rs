@@ -2,66 +2,98 @@
 //!
 //! Copyright (c) 2023, eunomia-bpf
 //! All rights reserved.
-pub mod auth;
-mod wasm;
+//!
 
-use anyhow::{anyhow, Result};
-use std::path::Path;
+use std::collections::HashMap;
 
+pub use oci_distribution;
 use oci_distribution::{
-    client::{ClientConfig, ClientProtocol},
-    Client,
+    annotations,
+    client::{Config, ImageLayer},
+    manifest,
+    secrets::RegistryAuth,
+    Client, Reference,
 };
 
-use tokio::fs::{File, OpenOptions};
-use tokio::io;
-use url::Url;
-/// Ex-export some helper functions from wasm module
-pub use wasm::wasm_pull;
-pub use wasm::wasm_push;
-pub use wasm::{PullArgs, PushArgs};
+pub mod auth;
 
-/// A helper function to get the default port for http or https
-fn default_schema_port(schema: &str) -> Result<u16> {
-    match schema {
-        "http" => Ok(80),
-        "https" => Ok(443),
-        _ => Err(anyhow!("unknown schema {}", schema)),
-    }
+#[cfg(test)]
+pub(crate) mod tests;
+
+use anyhow::{anyhow, bail, Context, Result};
+/// Pull a wasm image from the registry
+/// Use the authencation info provided by `auth`
+/// Provide your own client if you want to customization
+pub async fn pull_wasm_image(
+    reference: &Reference,
+    auth: &RegistryAuth,
+    client: Option<&mut Client>,
+) -> Result<Vec<u8>> {
+    let mut local_client = Client::default();
+    let client = client.unwrap_or(&mut local_client);
+    let out = client
+        .pull(reference, auth, vec![manifest::WASM_LAYER_MEDIA_TYPE])
+        .await
+        .with_context(|| anyhow!("Failed to pull wasm image"))?
+        .layers
+        .into_iter()
+        .next()
+        .map(|v| v.data)
+        .with_context(|| anyhow!("Data not found from the image"))?;
+    Ok(out)
 }
 
-/// Create a HTTP client for the given url
-pub fn get_client(url: &Url) -> Result<Client> {
-    let protocol = match url.scheme() {
-        "http" => Ok(ClientProtocol::Http),
-        "https" => Ok(ClientProtocol::Https),
-        _ => Err(anyhow!("unsupported schema {}", url.scheme())),
-    }?;
-
-    Ok(Client::new(ClientConfig {
-        protocol,
-        ..Default::default()
-    }))
-}
-
-/// Push an image to the OCI registry
-pub async fn push(args: PushArgs) -> Result<()> {
-    wasm_push(args.file, args.image_url, args.username, args.password).await?;
-    Ok(())
-}
-
-/// Pull an image from the registry
-pub async fn pull(args: PullArgs) -> Result<()> {
-    let path = Path::new(&args.write_file);
-    let mut file = if path.is_file() {
-        OpenOptions::new()
-            .write(true)
-            .open(&args.write_file)
-            .await?
-    } else {
-        File::create(&args.write_file).await?
+pub async fn push_wasm_image(
+    auth: &RegistryAuth,
+    reference: &Reference,
+    annotations: Option<HashMap<String, String>>,
+    module: &[u8],
+    client: Option<&mut Client>,
+) -> Result<()> {
+    let mut local_client = Client::default();
+    let client = client.unwrap_or(&mut local_client);
+    let layers = vec![ImageLayer::new(
+        module.to_vec(),
+        manifest::WASM_LAYER_MEDIA_TYPE.to_string(),
+        None,
+    )];
+    let config = Config {
+        annotations: None,
+        data: b"{}".to_vec(),
+        media_type: manifest::WASM_CONFIG_MEDIA_TYPE.to_string(),
     };
-    let data = wasm_pull(args.image_url.as_str(), args.username, args.password).await?;
-    io::copy(&mut &data[..], &mut file).await?;
+    let image_manifest = manifest::OciImageManifest::build(&layers, &config, annotations);
+    client
+        .push(reference, &layers, config, auth, Some(image_manifest))
+        .await
+        .with_context(|| anyhow!("Failed to push image"))?;
+
     Ok(())
+}
+/// Parse annotations like key=value into HashMap
+pub fn parse_annotations<T: AsRef<str>>(input: &[T]) -> anyhow::Result<HashMap<String, String>> {
+    let mut annotations_map = HashMap::default();
+    for ent in input.iter() {
+        if let Some((key, value)) = ent.as_ref().split_once('=') {
+            annotations_map.insert(key.into(), value.into());
+        } else {
+            bail!("Annotations should be like `key=value`");
+        }
+    }
+    Ok(annotations_map)
+}
+/// Parse annotations like key=value into HashMap
+/// Will insert ORG_OPENCONTAINERS_IMAGE_TITLE if not provided
+pub fn parse_annotations_and_insert_image_title<T: AsRef<str>>(
+    input: &[T],
+    title: String,
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut ret = parse_annotations(input)?;
+    if !ret.contains_key(&annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_owned()) {
+        ret.insert(
+            annotations::ORG_OPENCONTAINERS_IMAGE_TITLE.to_string(),
+            title,
+        );
+    }
+    Ok(ret)
 }
